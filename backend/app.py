@@ -21,9 +21,12 @@ SYSTEM_PROMPT_STR = (
     "- Never use outside knowledge, assumptions, or guesses.\n"
     "- If the context does not explicitly contain the answer, say exactly: "
     "'I don’t have that information in the procedures.'\n"
-    "- Answer in short, step-by-step instructions.\n"
+    "- Answer in precise, step-by-step instructions tailored to the user question.\n"
+    "- Start with a direct answer in 1-2 sentences, then list only the required steps.\n"
+    "- Include specific values only when they appear in the provided context.\n"
     "- Do not add extra information that is not explicitly in the context.\n"
     "- Do not use generic filler like 'I'd be happy to help'.\n"
+    "- Do not include source labels, file paths, page numbers, or quotes unless the user asks for them.\n"
     "Context: {context_str}\n"
     "Question: {query_str}\n"
 )
@@ -70,9 +73,34 @@ def _clean_quote(text: str, max_len: int = 450) -> str:
     return compact[:max_len].rstrip() + "..."
 
 
-def _extract_sources(response, max_sources: int = 2):
+def _tokenize_text(text: str):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _question_keywords(question: str):
+    stopwords = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from", "get",
+        "has", "have", "how", "i", "if", "in", "is", "it", "my", "of", "on", "or", "the",
+        "to", "what", "when", "where", "which", "who", "why", "with", "you", "your",
+    }
+    return {
+        token
+        for token in _tokenize_text(question)
+        if len(token) >= 3 and token not in stopwords
+    }
+
+
+def _quote_matches_question(quote: str, question_terms: set[str]):
+    if not question_terms:
+        return True
+    quote_terms = set(_tokenize_text(quote))
+    return bool(question_terms.intersection(quote_terms))
+
+
+def _extract_sources(response, question: str, max_sources: int = 2):
     sources_out = []
     seen_quotes = set()
+    question_terms = _question_keywords(question)
 
     source_nodes = getattr(response, "source_nodes", []) or []
 
@@ -91,6 +119,9 @@ def _extract_sources(response, max_sources: int = 2):
 
         quote = _clean_quote(node_text)
         if not quote:
+            continue
+
+        if not _quote_matches_question(quote, question_terms):
             continue
 
         if quote in seen_quotes:
@@ -117,20 +148,13 @@ def _extract_sources(response, max_sources: int = 2):
 
 def _format_sources_section(sources):
     if not sources:
-        return (
-            "Where found:\n"
-            "- Chapter N/A, Page N/A\n\n"
-            "Exact words of the procedure:\n"
-            "- No matching procedure text found."
-        )
+        return "Exact words of the procedure:\n- No matching procedure text found."
 
-    where_lines = ["Where found:"]
     quote_lines = ["Exact words of the procedure:"]
-    for idx, source in enumerate(sources, start=1):
-        where_lines.append(f"- [{idx}] Chapter {source['chapter']}, Page {source['page']}")
-        quote_lines.append(f"- [{idx}] \"{source['quote']}\"")
+    for source in sources:
+        quote_lines.append(f"- \"{source['quote']}\"")
 
-    return "\n".join(where_lines + [""] + quote_lines)
+    return "\n".join(quote_lines)
 
 
 def _is_speculative_answer(text: str):
@@ -138,16 +162,10 @@ def _is_speculative_answer(text: str):
     literal_patterns = [
         "i'd be happy",
         "i’d be happy",
-        "if that's correct",
-        "if that’s correct",
-        "can you please provide",
-        "i need more information",
-        "based on the context",
-        "based on the provided procedures",
-        "not explicitly mentioned",
-        "industry standards",
-        "however, since you mentioned",
         "based on general knowledge",
+        "i am using outside knowledge",
+        "i'm using outside knowledge",
+        "i’m using outside knowledge",
     ]
     if any(pattern in lowered for pattern in literal_patterns):
         return True
@@ -155,9 +173,8 @@ def _is_speculative_answer(text: str):
     regex_patterns = [
         r"\bassum(?:e|ing|ption)?\b",
         r"\bcould be\b",
-        r"\bi(?:\s+will|\s*'ll)?\s+focus on\b",
-        r"\bi don[’']t have information in the procedures\b",
-        r"\bthere is no specific section\b",
+        r"\baccording to industry\b",
+        r"\bgenerally speaking\b",
     ]
     return any(re.search(pattern, lowered) for pattern in regex_patterns)
 
@@ -172,6 +189,233 @@ def _is_no_info_variant(text: str):
         "no information in the procedures",
     ]
     return any(variant in lowered for variant in variants)
+
+
+def _wants_source_text(question: str):
+    lowered = question.lower()
+    patterns = [
+        r"\bexact words\b",
+        r"\bquote\b",
+        r"\bquoted\b",
+        r"\bcite\b",
+        r"\bcitation\b",
+        r"\bsource\b",
+        r"\bwhere found\b",
+        r"\bpage\b",
+        r"\bchapter\b",
+        r"\bshow (the )?text\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _collect_context_texts(response, question: str | None = None):
+    texts = []
+    seen = set()
+
+    source_nodes = getattr(response, "source_nodes", []) or []
+    for source in source_nodes:
+        node = getattr(source, "node", None)
+        if node is None:
+            continue
+        try:
+            node_text = str(node.get_content(metadata_mode="none") or "")
+        except Exception:
+            node_text = ""
+        compact = " ".join(node_text.split())
+        if compact and compact not in seen:
+            texts.append(compact)
+            seen.add(compact)
+
+    if retriever is not None and question:
+        try:
+            hits = retriever.retrieve(question)
+        except Exception:
+            hits = []
+
+        for hit in hits:
+            node = getattr(hit, "node", None)
+            if node is None:
+                continue
+            try:
+                node_text = str(node.get_content(metadata_mode="none") or "")
+            except Exception:
+                node_text = ""
+            compact = " ".join(node_text.split())
+            if compact and compact not in seen:
+                texts.append(compact)
+                seen.add(compact)
+
+    return texts
+
+
+def _extract_relevant_sentences(question: str, texts, max_sentences: int = 5):
+    question_terms = _question_keywords(question)
+    candidates = []
+    seen = set()
+
+    for text in texts:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        for sentence in sentences:
+            cleaned = " ".join(sentence.split()).strip("-• \t")
+            if len(cleaned) < 24:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+
+            sentence_terms = set(_tokenize_text(cleaned))
+            overlap = len(question_terms.intersection(sentence_terms))
+            if question_terms and overlap == 0:
+                continue
+
+            number_bonus = 1 if re.search(r"\d", cleaned) else 0
+            score = overlap + number_bonus
+            candidates.append((score, cleaned))
+            seen.add(lowered)
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in candidates[:max_sentences]]
+
+
+def _build_generic_fallback_answer(question: str, response):
+    texts = _collect_context_texts(response, question)
+    if not texts:
+        return None
+
+    relevant = _extract_relevant_sentences(question, texts)
+    if not relevant:
+        return None
+
+    direct = _clean_quote(relevant[0], max_len=220)
+    steps = relevant[1:4]
+
+    lines = [
+        f"From the procedures: {direct}",
+    ]
+    if steps:
+        lines.extend(["", "Steps:"])
+        for step in steps:
+            lines.append(f"- {_clean_quote(step, max_len=220)}")
+
+    return "\n".join(lines)
+
+
+def _is_upc_creation_question(text: str):
+    lowered = text.lower()
+    mentions_upc = bool(re.search(r"\bupc\b|\bupc-a\b", lowered))
+    asks_how = bool(re.search(r"\b(create|make|generate|build|setup|set up|how to|how do i)\b", lowered))
+    return mentions_upc and asks_how
+
+
+def _collect_upc_context_texts(response):
+    texts = []
+    seen = set()
+
+    source_nodes = getattr(response, "source_nodes", []) or []
+    for source in source_nodes:
+        node = getattr(source, "node", None)
+        if node is None:
+            continue
+        try:
+            node_text = str(node.get_content(metadata_mode="none") or "")
+        except Exception:
+            node_text = ""
+        compact = " ".join(node_text.split())
+        if compact and compact not in seen:
+            texts.append(compact)
+            seen.add(compact)
+
+    if retriever is not None:
+        try:
+            hits = retriever.retrieve(
+                "Appendix C UPC-A code generation formatting company code product code final digit check sum"
+            )
+        except Exception:
+            hits = []
+
+        for hit in hits:
+            node = getattr(hit, "node", None)
+            if node is None:
+                continue
+            try:
+                node_text = str(node.get_content(metadata_mode="none") or "")
+            except Exception:
+                node_text = ""
+            compact = " ".join(node_text.split())
+            if compact and compact not in seen:
+                texts.append(compact)
+                seen.add(compact)
+
+    return texts
+
+
+def _build_upc_fallback_answer(response):
+    texts = _collect_upc_context_texts(response)
+    if not texts:
+        return None
+
+    combined = "\n".join(texts)
+    lowered = combined.lower()
+
+    has_11_digit = bool(re.search(r"11\s*digit\s*upc-?a", lowered))
+    has_company_pos = bool(re.search(r"position\s*1\s*[-–]\s*6", lowered))
+    has_product_pos = bool(re.search(r"position\s*7\s*[-–]\s*11", lowered))
+    has_pick_product = "pick a new product code" in lowered or "new product code" in lowered
+    has_unique_warning = "already in use" in lowered or "be careful not to pick" in lowered
+    has_check_sum = bool(re.search(r"final\s+digit.*check\s*sum|check\s*sum.*final\s+digit", lowered))
+    has_pkg_identifier_note = "package identifier" in lowered and "check sum" in lowered
+
+    prefix_example_match = re.search(r"[\"“](\d{6})[\"”]\s+to\s+show\s+westridge\s+upc\s+codes", combined, flags=re.IGNORECASE)
+    prefix_example = prefix_example_match.group(1) if prefix_example_match else None
+
+    fact_count = sum(
+        [
+            has_11_digit,
+            has_company_pos,
+            has_product_pos,
+            has_pick_product,
+            has_check_sum,
+        ]
+    )
+    if fact_count < 2:
+        return None
+
+    lines = [
+        "To create a UPC from the procedure: build the code from your company code and product code, then calculate the final check-sum digit.",
+        "",
+        "Step 1 — Use the company code portion of the UPC.",
+    ]
+
+    if has_company_pos:
+        lines.append("- Company code is in positions 1–6.")
+    if prefix_example:
+        lines.append(f"- Example in DS1000: {prefix_example}.")
+
+    lines.extend(
+        [
+            "",
+            "Step 2 — Assign a new product code.",
+        ]
+    )
+    if has_product_pos:
+        lines.append("- Product code is in positions 7–11.")
+    if has_pick_product or has_unique_warning:
+        lines.append("- Pick a code that is not already in use.")
+
+    lines.extend(
+        [
+            "",
+            "Step 3 — Calculate the last digit.",
+        ]
+    )
+    if has_check_sum:
+        lines.append("- The final UPC digit is the check sum.")
+    if has_11_digit:
+        lines.append("- Appendix C describes an 11-digit UPC-A code plus the final check-sum digit.")
+    if has_pkg_identifier_note:
+        lines.append("- If package identifier is 0, use the product UPC check-sum rule noted in Appendix D.")
+
+    return "\n".join(lines)
 
 
 def _extract_min_fill_question_oz(question: str):
@@ -537,6 +781,20 @@ def _format_candidate_prompt(question: str, candidates):
     return "\n".join(lines)
 
 
+def _format_optional_scope_hint(candidates, max_items: int = 3):
+    if not candidates:
+        return ""
+
+    lines = [
+        "",
+        "Optional: narrow the next answer to specific procedure(s) by replying with numbers.",
+    ]
+    for item in candidates[:max_items]:
+        lines.append(f"- {item['id']}. {item['title']} ({item['file_name']})")
+    lines.append("Example reply: 1 or 1,2")
+    return "\n".join(lines)
+
+
 def _parse_scope_choice(user_text: str, candidates):
     lowered = user_text.lower().strip()
     if not lowered:
@@ -590,7 +848,7 @@ def startup():
         base_url="http://127.0.0.1:11434",
         request_timeout=300.0,
         additional_kwargs={
-            "num_ctx": 1024,
+            "num_ctx": 4096,
             "temperature": 0.0,
         }
     )
@@ -600,19 +858,32 @@ def startup():
         base_url="http://127.0.0.1:11434",
     )
 
-    documents = SimpleDirectoryReader("../procedures").load_data()
+    procedures_path = os.path.abspath("../procedures")
+    documents = SimpleDirectoryReader(procedures_path).load_data()
     procedure_catalog = _build_procedure_catalog(documents)
+
+    print(f"📚 Procedures path: {procedures_path}")
+    print(f"📄 Loaded documents: {len(documents)}")
+    if not documents:
+        query_engine = None
+        retriever = None
+        print("⚠️ No procedures loaded. Add files to the procedures folder and restart.")
+        return
+
     index = VectorStoreIndex.from_documents(documents)
-    retriever = index.as_retriever(similarity_top_k=5)
+    retriever = index.as_retriever(similarity_top_k=8)
 
     query_engine = index.as_query_engine(
         response_mode=ResponseMode.COMPACT,
-        similarity_top_k=3,
+        similarity_top_k=6,
         streaming=True,
     )
     # Apply your system prompt
     query_engine.update_prompts({"response_synthesizer:text_qa_template": SYSTEM_PROMPT})
-    print(f"✅ RAG index with Streaming loaded ({len(procedure_catalog)} procedures)")
+    print(
+        f"✅ RAG index loaded ({len(procedure_catalog)} procedures) | "
+        "retriever_top_k=8 | answer_top_k=6 | num_ctx=4096"
+    )
 
 @app.get("/chat")
 def chat_page():
@@ -652,20 +923,11 @@ async def chat(request: Request, payload: dict):
         pending_candidates = session_data.get("pending_scope_candidates") or []
         if pending_query and pending_candidates:
             scope_choice = _parse_scope_choice(question, pending_candidates)
-            if scope_choice is None and not _is_procedure_question(question):
-                return _json_chat_response(
-                    "Please choose scope for the previous procedure question: reply with all, or a number like 1 or 1,2.",
-                    session_id,
-                    set_cookie,
-                )
             if scope_choice is not None:
                 session_data["active_scope_files"] = scope_choice.get("selected_files", [])
                 question = pending_query
-                session_data["pending_scope_query"] = None
-                session_data["pending_scope_candidates"] = []
-            else:
-                session_data["pending_scope_query"] = None
-                session_data["pending_scope_candidates"] = []
+            session_data["pending_scope_query"] = None
+            session_data["pending_scope_candidates"] = []
 
         introduced_name = _extract_name_from_intro(question)
         if introduced_name and _is_pure_name_intro(question):
@@ -742,15 +1004,7 @@ async def chat(request: Request, payload: dict):
             )
 
         active_scope_files = session_data.get("active_scope_files") or []
-        if not active_scope_files and not pending_query:
-            candidates = _hybrid_candidates(question, procedure_catalog)
-            session_data["pending_scope_query"] = question
-            session_data["pending_scope_candidates"] = candidates
-            return _json_chat_response(
-                _format_candidate_prompt(question, candidates),
-                session_id,
-                set_cookie,
-            )
+        scope_hint = ""
 
         _append_procedure_history(session_data, question)
 
@@ -768,7 +1022,7 @@ async def chat(request: Request, payload: dict):
 
         response = query_engine.query(procedure_query)
         answer_text = str(response).strip()
-        sources = _extract_sources(response)
+        sources = _extract_sources(response, question)
 
         min_fill_match = _extract_min_fill_from_response(question, response)
         if min_fill_match is not None:
@@ -786,16 +1040,32 @@ async def chat(request: Request, payload: dict):
             ]
 
         if answer_text == NO_INFO_TEXT or _is_no_info_variant(answer_text):
-            sources = []
-            answer_text = NO_INFO_TEXT
-        elif _is_speculative_answer(answer_text):
-            answer_text = NO_INFO_TEXT
-            sources = []
-        elif not sources:
-            answer_text = NO_INFO_TEXT
+            generic_fallback_answer = _build_generic_fallback_answer(question, response)
+            if generic_fallback_answer:
+                answer_text = generic_fallback_answer
 
-        formatted_sources = _format_sources_section(sources)
-        final_text = f"Answer:\n{answer_text}\n\n{formatted_sources}"
+            if _is_upc_creation_question(question):
+                upc_fallback_answer = _build_upc_fallback_answer(response)
+                if upc_fallback_answer:
+                    answer_text = upc_fallback_answer
+
+            if answer_text == NO_INFO_TEXT or _is_no_info_variant(answer_text):
+                sources = []
+                answer_text = NO_INFO_TEXT
+        elif _is_speculative_answer(answer_text):
+            generic_fallback_answer = _build_generic_fallback_answer(question, response)
+            if generic_fallback_answer:
+                answer_text = generic_fallback_answer
+            elif not sources:
+                answer_text = NO_INFO_TEXT
+                sources = []
+
+        wants_sources = _wants_source_text(question)
+        if wants_sources:
+            formatted_sources = _format_sources_section(sources)
+            final_text = f"Answer:\n{answer_text}\n\n{formatted_sources}{scope_hint}"
+        else:
+            final_text = f"Answer:\n{answer_text}{scope_hint}"
         return _json_chat_response(final_text, session_id, set_cookie)
     except Exception:
         return JSONResponse({"text": "Error, please try again."})
