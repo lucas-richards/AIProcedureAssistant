@@ -1,0 +1,14 @@
+# Local virtual environments
+venv/
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local environment files
+.env
+.env.*
+
+# Project-local data/documents not for GitHub
+procedures/

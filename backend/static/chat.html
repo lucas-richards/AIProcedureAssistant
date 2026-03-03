@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <title>Procedure Assistant</title>
+    <script type="module" src="https://unpkg.com/deep-chat@1.4.10/dist/deepChat.bundle.js"></script>
+    <style>
+        /* 1. Reset and Font */
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; height: 100vh; background-color: #f0f2f5; }
+
+        /* 2. Floating Wrapper */
+        #chat-wrapper {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            z-index: 9999;
+        }
+
+        /* 3. The Window (This fixes your image issue) */
+        #chat-window {
+            width: 380px;
+            height: 600px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 12px 28px rgba(0,0,0,0.2);
+            display: none; /* Toggle with JS */
+            flex-direction: column;
+            margin-bottom: 15px;
+            overflow: hidden;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            border: 1px solid #e0e0e0;
+        }
+
+        /* Expanded Logic */
+        #chat-window.expanded {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            margin-bottom: 0;
+            border-radius: 0;
+        }
+
+        /* 4. Launcher Button */
+        #launcher {
+            width: 60px;
+            height: 60px;
+            background: #2563eb;
+            color: white;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            font-size: 30px;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4);
+            transition: transform 0.2s;
+        }
+        #launcher:hover { transform: scale(1.05); }
+
+        /* 5. Header Controls overlay */
+        .controls {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            z-index: 20;
+            display: flex;
+            gap: 10px;
+        }
+        .controls button {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: black;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .controls button:hover { background: rgba(255,255,255,0.3); }
+
+        /* Ensure deep-chat fills the container */
+        deep-chat {
+            height: 100% !important;
+            width: 100% !important;
+            --chat-background-color: #ffffff;
+        }
+    </style>
+</head>
+<body>
+
+<div id="chat-wrapper">
+    <div id="chat-window">
+        <div class="controls">
+            <button onclick="toggleExpand()">⤢</button>
+            <button onclick="toggleChat()">✕</button>
+        </div>
+        
+        <deep-chat
+            id="chat-element"
+            request='{"url": "/chat", "method": "POST"}'
+            initialMessages='[{"role": "ai", "text": "Hello! I am your Procedure Assistant. Ask me anything about our internal docs."}]'
+            header='{"title": "Internal Docs Assistant", "styles": {"container": {"backgroundColor": "#2563eb", "color": "white", "padding": "15px"}}}'
+            messageStyles='{"default": {"user": {"bubble": {"backgroundColor": "#2563eb", "color": "white"}}, "ai": {"bubble": {"backgroundColor": "#f3f4f6"}}}}'
+            textInput='{"placeholder": {"text": "Type a procedure question..."}}'
+            submitButtonStyles='{"submit": {"container": {"default": {"backgroundColor": "#2563eb"}}}}'
+        ></deep-chat>
+    </div>
+
+    <button id="launcher" onclick="toggleChat()">💬</button>
+</div>
+
+<script>
+    const win = document.getElementById('chat-window');
+    const launcher = document.getElementById('launcher');
+
+    function toggleChat() {
+        if (win.style.display === 'flex') {
+            win.style.display = 'none';
+            launcher.innerHTML = '💬';
+        } else {
+            win.style.display = 'flex';
+            launcher.innerHTML = '↓';
+        }
+    }
+
+    function toggleExpand() {
+        win.classList.toggle('expanded');
+    }
+</script>
+
+</body>
+</html>
